@@ -25,6 +25,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from voice2prompt.utils.device import select_device
 from voice2prompt.utils.logging import get_logger
@@ -73,7 +74,7 @@ class Transcriber:
         self._model_name: str = config.get("model", "parakeet-tdt-0.6b-v2")
         self._whisper_size: str = config.get("whisper_size", _WHISPER_DEFAULT)
         self._backend: str | None = None   # set during _load_model
-        self._model = None                 # lazy-loaded
+        self._model: Any = None            # lazy-loaded
 
     # ------------------------------------------------------------------
     # Public API
@@ -109,14 +110,11 @@ class Transcriber:
             if loaded is not None:
                 self._backend, self._model = loaded
                 return
-            logger.warning(
-                "nemo_unavailable",
-                msg="NeMo not installed; falling back to faster-whisper",
-            )
+            logger.warning("nemo_unavailable: falling back to faster-whisper")
 
         self._backend, self._model = self._load_faster_whisper()
 
-    def _try_load_nemo(self) -> tuple[str, object] | None:
+    def _try_load_nemo(self) -> tuple[str, Any] | None:
         """Attempt to load Parakeet via NeMo. Returns None if NeMo not installed."""
         try:
             import nemo.collections.asr as nemo_asr  # type: ignore
@@ -131,7 +129,7 @@ class Transcriber:
         model.eval()
         return ("nemo", model)
 
-    def _load_faster_whisper(self) -> tuple[str, object]:
+    def _load_faster_whisper(self) -> tuple[str, Any]:
         from faster_whisper import WhisperModel  # type: ignore
 
         # faster-whisper does not support MPS; map it to cpu
@@ -254,10 +252,7 @@ class Transcriber:
         faster-whisper accepts a file path string or a file-like object.
         For bytes we wrap in BytesIO.
         """
-        if isinstance(audio, bytes):
-            audio_source = io.BytesIO(audio)
-        else:
-            audio_source = str(audio)
+        audio_source: Any = io.BytesIO(audio) if isinstance(audio, bytes) else str(audio)
 
         segments, info = self._model.transcribe(
             audio_source,

@@ -11,29 +11,40 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Aayush Pathak", email = "aapathak@nvidia.com" }]
 
+# Lightweight base: pure-Python or trivially installable on all platforms.
+# All ML/audio runtime deps are in [ml] below.
 dependencies = [
-    # Stage 1 — STT + audio capture
-    "faster-whisper>=1.0.0",
-    "soundfile>=0.12.1",
-    "sounddevice>=0.4.6",
-    "numpy>=1.24",
-    # Stage 2 — LLM Formatter
-    "llama-cpp-python>=0.2.90",
-    # Stage 3 — Compressor
-    "llmlingua>=0.2.2",
-    # Emit layer
     "httpx>=0.27.0",
-    # Config + utilities
+    "numpy>=1.24",
     "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
+# Full ML runtime — install locally with: pip install -e ".[ml]"
+# Not required for tests (all model calls are mocked).
+ml = [
+    # Stage 1 — STT
+    "faster-whisper>=1.0.0",
+    "soundfile>=0.12.1",
+    # Stage 1 — audio capture (requires PortAudio system library)
+    "sounddevice>=0.4.6",
+    # Stage 2 — LLM Formatter (requires C++ build toolchain or pre-built wheel)
+    "llama-cpp-python>=0.2.90",
+    # Stage 3 — Compressor (pulls in torch ~2 GB)
+    "llmlingua>=0.2.2",
+]
+
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "rouge-score>=0.1.2",
     "mypy>=1.9",
     "ruff>=0.4",
+]
+
+# Convenience: everything at once for local development
+all = [
+    "voice2prompt[ml,dev]",
 ]
 
 [tool.setuptools.packages.find]

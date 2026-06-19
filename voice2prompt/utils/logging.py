@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from typing import Any
+from typing import Any, MutableMapping
 
 
 class _JsonFormatter(logging.Formatter):
@@ -41,7 +41,7 @@ class _JsonFormatter(logging.Formatter):
 class _KVAdapter(logging.LoggerAdapter):
     """Allows logger.info("event", key=val, ...) syntax."""
 
-    def process(self, msg: str, kwargs: dict) -> tuple[str, dict]:
+    def process(self, msg: str, kwargs: MutableMapping[str, Any]) -> tuple[str, MutableMapping[str, Any]]:
         extra = kwargs.pop("extra", {})
         # Merge any keyword args into extra so the formatter picks them up
         for k in list(kwargs.keys()):

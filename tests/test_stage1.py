@@ -293,7 +293,6 @@ class TestTranscriberMocked:
 
     @pytest.mark.asyncio
     async def test_transcribe_accepts_path(self, transcriber, fake_result, tmp_path, monkeypatch):
-        from pathlib import Path
 
         audio_file = tmp_path / "test.wav"
         audio_file.write_bytes(_make_wav_bytes())
@@ -396,7 +395,6 @@ class TestFasterWhisperDeviceMapping:
             loaded["compute_type"] = compute_type
             return object()
 
-        import voice2prompt.stage1_stt.transcriber as mod
         monkeypatch.setattr(
             "voice2prompt.stage1_stt.transcriber.WhisperModel",
             _fake_whisper,

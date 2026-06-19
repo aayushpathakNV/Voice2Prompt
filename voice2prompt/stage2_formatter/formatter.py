@@ -21,6 +21,7 @@ import asyncio
 import re
 import time
 from pathlib import Path
+from typing import Any
 
 from voice2prompt.utils.logging import get_logger
 
@@ -53,7 +54,7 @@ class Formatter:
         self._max_tokens = config.get("max_tokens", 512)
         self._temperature = config.get("temperature", 0.0)
         self._context_size = config.get("context_size", 2048)
-        self._llm = None  # lazy-loaded on first call
+        self._llm: Any = None  # lazy-loaded on first call
 
     def _load_model(self):
         if self._llm is not None:
@@ -84,7 +85,7 @@ class Formatter:
             queue:      asyncio.Queue shared with Stage 3 compressor.
         """
         self._load_model()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         try:
             await loop.run_in_executor(None, self._stream_sync, transcript, queue, loop)

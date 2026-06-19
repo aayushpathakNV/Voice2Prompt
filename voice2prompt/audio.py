@@ -18,7 +18,8 @@ import platform
 import queue
 import threading
 import wave
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -114,10 +115,7 @@ def record_until_silence(
     system = platform.system()
     if system == "Windows":
         try:
-            wasapi_api = next(
-                i for i, h in enumerate(sd.query_hostapis())
-                if "WASAPI" in h["name"]
-            )
+            next(i for i, h in enumerate(sd.query_hostapis()) if "WASAPI" in h["name"])
             extra_kwargs["extra_settings"] = sd.WasapiSettings(exclusive=False)
         except StopIteration:
             pass  # fall back to default API
@@ -162,7 +160,7 @@ def record_until_silence(
     return _to_wav_bytes(audio_np, cfg.sample_rate)
 
 
-def load_audio_file(path: str | "Path") -> bytes:
+def load_audio_file(path: str | Path) -> bytes:
     """
     Load a WAV, MP3, or M4A file and return WAV bytes resampled to 16 kHz mono.
     Uses soundfile for WAV/FLAC, ffmpeg (via subprocess) for MP3/M4A.

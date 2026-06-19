@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Any
 
 from voice2prompt.utils.logging import get_logger
 
@@ -52,7 +53,7 @@ class Compressor:
         self._rate = config.get("rate", 0.4)
         self._force_tokens: list[str] = config.get("force_tokens", ["##", "-", "**"])
         self._drop_consecutive = config.get("drop_consecutive", True)
-        self._compressor = None  # lazy-loaded on first call
+        self._compressor: Any = None  # lazy-loaded on first call
 
     def _load_model(self):
         if self._compressor is not None:
@@ -94,7 +95,7 @@ class Compressor:
             sentences.append(item)
 
         formatted_text = "\n".join(sentences)
-        result = await asyncio.get_event_loop().run_in_executor(
+        result = await asyncio.get_running_loop().run_in_executor(
             None, self._compress_sync, formatted_text
         )
         result.latency_ms = (time.perf_counter() - t0) * 1000
@@ -176,7 +177,7 @@ class Compressor:
         """
         self._load_model()
         t0 = time.perf_counter()
-        result = await asyncio.get_event_loop().run_in_executor(
+        result = await asyncio.get_running_loop().run_in_executor(
             None, self._compress_sync, prompt
         )
         result.latency_ms = (time.perf_counter() - t0) * 1000

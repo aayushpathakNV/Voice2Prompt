@@ -25,13 +25,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install dependencies
+      # ML runtime deps (llama-cpp-python, llmlingua, sounddevice) are in the
+      # [ml] optional group and are NOT installed in CI — all model calls are
+      # mocked in tests. Only the lightweight base + dev deps are needed.
+      - name: Install package and dev dependencies
         run: pip install -e ".[dev]"
-
-      # llama-cpp-python requires a C++ build; install the pre-built CPU wheel
-      # GPU wheels are not available on CI runners — GPU tests run locally only
-      - name: Install llama-cpp-python (CPU, pre-built)
-        run: pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 
       - name: Run tests
         run: pytest tests/ -v --tb=short

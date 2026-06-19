@@ -134,7 +134,6 @@ class TestPipelineWithFixtures:
         reason="No audio fixtures found in tests/fixtures/",
     )
     async def test_fixture_produces_valid_output(self, audio_fixture, monkeypatch):
-        from voice2prompt.pipeline import Pipeline
         pipeline = _make_mock_pipeline(monkeypatch)
         result = await pipeline.run(audio_fixture)
         assert result.prompt
