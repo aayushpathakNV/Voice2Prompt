@@ -1,11 +1,17 @@
 """
 Stage 1 — Speech-to-Text.
 
-Primary:  NVIDIA Parakeet TDT 0.6B v2 (NeMo / HuggingFace transformers)
+Primary:  NVIDIA Parakeet TDT 0.6B v2 via NeMo.
           RTFx ~900x on RTX 1000 Ada → ~35 ms for 30 s audio.
-Fallback: faster-whisper (Whisper Large V3 Turbo, CTranslate2 INT8)
-          RTFx ~70x → ~60-80 ms for 30 s audio. Used when NeMo unavailable
-          or non-English input detected.
+          Model: nvidia/parakeet-tdt-0.6b-v2
+
+Fallback: faster-whisper (Whisper Large V3 Turbo, CTranslate2 INT8/float16).
+          RTFx ~70x on RTX 1000 Ada → ~60-80 ms for 30 s audio.
+          Activated when NeMo is not installed or config model is "faster-whisper".
+
+Fallback chain: NeMo Parakeet → faster-whisper
+  (HuggingFace transformers does not expose a usable Parakeet TDT decoder
+   without NeMo, so we skip that path entirely.)
 
 Budget: <= 100 ms on RTX 1000 Ada (50 W TGP).
 """
@@ -13,6 +19,10 @@ Budget: <= 100 ms on RTX 1000 Ada (50 W TGP).
 from __future__ import annotations
 
 import asyncio
+import io
+import os
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,6 +30,13 @@ from voice2prompt.utils.device import select_device
 from voice2prompt.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# NeMo model IDs
+_PARAKEET_V2 = "nvidia/parakeet-tdt-0.6b-v2"
+_PARAKEET_V3 = "nvidia/parakeet-tdt-0.6b-v3"  # 25-language, use for non-English
+
+# faster-whisper model sizes — Large V3 Turbo is the default
+_WHISPER_DEFAULT = "large-v3-turbo"
 
 
 @dataclass
@@ -41,140 +58,229 @@ class TranscriptResult:
 
 class Transcriber:
     """
-    Wraps either Parakeet TDT 0.6B v2 or faster-whisper depending on config
-    and runtime availability.
+    Wraps Parakeet TDT 0.6B v2 (NeMo) or faster-whisper depending on config
+    and runtime availability. Models are lazy-loaded on first transcribe() call.
+
+    Config keys (all optional):
+        model:         "parakeet-tdt-0.6b-v2" | "parakeet-tdt-0.6b-v3" | "faster-whisper"
+        device:        "auto" | "cuda" | "mps" | "cpu"
+        whisper_size:  faster-whisper model size, default "large-v3-turbo"
     """
 
     def __init__(self, config: dict):
         self._config = config
         self._device = select_device(config.get("device", "auto"))
-        self._model_name = config.get("model", "parakeet-tdt-0.6b-v2")
-        self._model = None  # lazy-loaded on first call
+        self._model_name: str = config.get("model", "parakeet-tdt-0.6b-v2")
+        self._whisper_size: str = config.get("whisper_size", _WHISPER_DEFAULT)
+        self._backend: str | None = None   # set during _load_model
+        self._model = None                 # lazy-loaded
 
-    def _load_model(self):
-        if self._model is not None:
-            return
-
-        if "parakeet" in self._model_name:
-            self._model = self._load_parakeet()
-        else:
-            self._model = self._load_faster_whisper()
-
-    def _load_parakeet(self):
-        """Load Parakeet TDT 0.6B v2 via NeMo or HuggingFace transformers."""
-        try:
-            import nemo.collections.asr as nemo_asr  # type: ignore
-            logger.info("loading_parakeet", backend="nemo", device=self._device)
-            model = nemo_asr.models.ASRModel.from_pretrained(
-                "nvidia/parakeet-tdt-0.6b-v2"
-            )
-            model = model.to(self._device)
-            return ("parakeet_nemo", model)
-        except ImportError:
-            logger.warning("nemo_unavailable", fallback="huggingface_transformers")
-
-        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor  # type: ignore
-        logger.info("loading_parakeet", backend="transformers", device=self._device)
-        processor = AutoProcessor.from_pretrained("nvidia/parakeet-tdt-0.6b-v2")
-        model = AutoModelForSpeechSeq2Seq.from_pretrained("nvidia/parakeet-tdt-0.6b-v2")
-        model = model.to(self._device)
-        return ("parakeet_hf", (processor, model))
-
-    def _load_faster_whisper(self):
-        from faster_whisper import WhisperModel  # type: ignore
-        device = "cuda" if "cuda" in self._device else "cpu"
-        compute_type = "int8" if device == "cpu" else "float16"
-        logger.info("loading_faster_whisper", device=device, compute_type=compute_type)
-        model = WhisperModel("large-v3-turbo", device=device, compute_type=compute_type)
-        return ("faster_whisper", model)
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     async def transcribe(self, audio: bytes | Path) -> TranscriptResult:
         """
-        Transcribe audio. Runs blocking inference in a thread pool executor
-        to avoid blocking the asyncio event loop.
+        Transcribe audio. Blocking inference runs in a thread pool executor
+        so it does not block the asyncio event loop.
 
         Args:
-            audio: Raw PCM bytes or path to WAV/MP3/M4A file.
+            audio: WAV bytes (from audio.py) or a Path to a WAV/MP3/M4A file.
 
         Returns:
-            TranscriptResult with text, word timestamps, and latency.
+            TranscriptResult with .text, .word_timestamps, .latency_ms.
         """
         self._load_model()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._transcribe_sync, audio)
 
-    def _transcribe_sync(self, audio: bytes | Path) -> TranscriptResult:
-        import time
+    # ------------------------------------------------------------------
+    # Model loading
+    # ------------------------------------------------------------------
 
-        t0 = time.perf_counter()
-        backend, model = self._model
+    def _load_model(self) -> None:
+        if self._model is not None:
+            return
 
-        if backend == "parakeet_nemo":
-            result = self._run_parakeet_nemo(model, audio)
-        elif backend == "parakeet_hf":
-            processor, hf_model = model
-            result = self._run_parakeet_hf(processor, hf_model, audio)
+        use_parakeet = "parakeet" in self._model_name.lower()
+
+        if use_parakeet:
+            loaded = self._try_load_nemo()
+            if loaded is not None:
+                self._backend, self._model = loaded
+                return
+            logger.warning(
+                "nemo_unavailable",
+                msg="NeMo not installed; falling back to faster-whisper",
+            )
+
+        self._backend, self._model = self._load_faster_whisper()
+
+    def _try_load_nemo(self) -> tuple[str, object] | None:
+        """Attempt to load Parakeet via NeMo. Returns None if NeMo not installed."""
+        try:
+            import nemo.collections.asr as nemo_asr  # type: ignore
+        except ImportError:
+            return None
+
+        nemo_id = _PARAKEET_V3 if "v3" in self._model_name else _PARAKEET_V2
+        logger.info("loading_model", backend="nemo", model=nemo_id, device=self._device)
+
+        model = nemo_asr.models.ASRModel.from_pretrained(nemo_id)
+        model = model.to(self._device)
+        model.eval()
+        return ("nemo", model)
+
+    def _load_faster_whisper(self) -> tuple[str, object]:
+        from faster_whisper import WhisperModel  # type: ignore
+
+        # faster-whisper does not support MPS; map it to cpu
+        if self._device == "mps":
+            fw_device = "cpu"
+            compute_type = "int8"
+            logger.warning("faster_whisper_mps_unsupported", fallback="cpu+int8")
+        elif self._device == "cuda":
+            fw_device = "cuda"
+            compute_type = "float16"
         else:
-            result = self._run_faster_whisper(model, audio)
+            fw_device = "cpu"
+            compute_type = "int8"
+
+        logger.info(
+            "loading_model",
+            backend="faster-whisper",
+            model=self._whisper_size,
+            device=fw_device,
+            compute_type=compute_type,
+        )
+        model = WhisperModel(self._whisper_size, device=fw_device, compute_type=compute_type)
+        return ("faster_whisper", model)
+
+    # ------------------------------------------------------------------
+    # Synchronous inference (runs in thread pool)
+    # ------------------------------------------------------------------
+
+    def _transcribe_sync(self, audio: bytes | Path) -> TranscriptResult:
+        t0 = time.perf_counter()
+
+        if self._backend == "nemo":
+            result = self._run_nemo(audio)
+        else:
+            result = self._run_faster_whisper(audio)
 
         result.latency_ms = (time.perf_counter() - t0) * 1000
         logger.info(
             "transcription_complete",
             model_id=result.model_id,
-            latency_ms=result.latency_ms,
-            tokens_out=len(result.text.split()),
+            backend=self._backend,
+            latency_ms=round(result.latency_ms, 1),
+            word_count=len(result.text.split()),
         )
         return result
 
-    def _run_parakeet_nemo(self, model, audio: bytes | Path) -> TranscriptResult:
-        # NeMo expects a file path; write bytes to a temp file if needed
-        import tempfile, os
+    # ------------------------------------------------------------------
+    # NeMo backend
+    # ------------------------------------------------------------------
+
+    def _run_nemo(self, audio: bytes | Path) -> TranscriptResult:
+        """
+        NeMo's transcribe() requires a file path (not bytes).
+        For bytes input we write a temp WAV, transcribe, then delete.
+        Windows doesn't allow deleting an open file, so we use delete=False
+        and clean up in a finally block.
+        """
+        tmp_path: str | None = None
+        try:
+            if isinstance(audio, bytes):
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                    f.write(audio)
+                    tmp_path = f.name
+                input_path = tmp_path
+            else:
+                input_path = str(audio)
+
+            output = self._model.transcribe([input_path], timestamps=True)
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass  # best-effort cleanup
+
+        return self._parse_nemo_output(output)
+
+    def _parse_nemo_output(self, output: list) -> TranscriptResult:
+        """
+        Parse NeMo ASRModel.transcribe() output.
+
+        NeMo returns a list of Hypothesis objects (one per audio file).
+        The Hypothesis has:
+          .text              — final transcript string
+          .timestep          — dict with 'word' key → list of (word, start, end)
+                               (only populated when timestamps=True)
+        Older NeMo versions may return plain strings; we handle both.
+        """
+        if not output:
+            return TranscriptResult(text="", model_id=self._model_name)
+
+        hyp = output[0]
+
+        # Older NeMo: returns plain strings
+        if isinstance(hyp, str):
+            return TranscriptResult(text=hyp.strip(), model_id=self._model_name)
+
+        text = hyp.text.strip() if hasattr(hyp, "text") else str(hyp).strip()
+
+        words: list[WordTimestamp] = []
+        if hasattr(hyp, "timestep") and isinstance(hyp.timestep, dict):
+            raw_words = hyp.timestep.get("word", [])
+            for entry in raw_words:
+                # NeMo word timestamp entries: (word_str, start_sec, end_sec)
+                if isinstance(entry, (list, tuple)) and len(entry) >= 3:
+                    words.append(WordTimestamp(word=entry[0], start_s=entry[1], end_s=entry[2]))
+
+        return TranscriptResult(
+            text=text,
+            model_id=self._model_name,
+            word_timestamps=words,
+        )
+
+    # ------------------------------------------------------------------
+    # faster-whisper backend
+    # ------------------------------------------------------------------
+
+    def _run_faster_whisper(self, audio: bytes | Path) -> TranscriptResult:
+        """
+        faster-whisper accepts a file path string or a file-like object.
+        For bytes we wrap in BytesIO.
+        """
         if isinstance(audio, bytes):
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                f.write(audio)
-                tmp_path = f.name
+            audio_source = io.BytesIO(audio)
         else:
-            tmp_path = str(audio)
+            audio_source = str(audio)
 
-        output = model.transcribe([tmp_path], timestamps=True)
+        segments, info = self._model.transcribe(
+            audio_source,
+            word_timestamps=True,
+            language=None,  # auto-detect
+        )
 
-        if isinstance(audio, bytes):
-            os.unlink(tmp_path)
+        text_parts: list[str] = []
+        words: list[WordTimestamp] = []
 
-        text = output[0].text if hasattr(output[0], "text") else str(output[0])
-        return TranscriptResult(text=text, model_id="parakeet-tdt-0.6b-v2")
-
-    def _run_parakeet_hf(self, processor, model, audio: bytes | Path) -> TranscriptResult:
-        import torch, soundfile as sf, io  # type: ignore
-
-        if isinstance(audio, bytes):
-            waveform, sr = sf.read(io.BytesIO(audio))
-        else:
-            waveform, sr = sf.read(str(audio))
-
-        inputs = processor(waveform, sampling_rate=sr, return_tensors="pt").to(self._device)
-        with torch.no_grad():
-            ids = model.generate(**inputs)
-        text = processor.batch_decode(ids, skip_special_tokens=True)[0]
-        return TranscriptResult(text=text, model_id="parakeet-tdt-0.6b-v2-hf")
-
-    def _run_faster_whisper(self, model, audio: bytes | Path) -> TranscriptResult:
-        import io
-        audio_source = io.BytesIO(audio) if isinstance(audio, bytes) else str(audio)
-        segments, info = model.transcribe(audio_source, word_timestamps=True)
-
-        words = []
-        text_parts = []
+        # segments is a generator — consume fully
         for segment in segments:
             text_parts.append(segment.text)
             if segment.words:
                 for w in segment.words:
-                    words.append(WordTimestamp(word=w.word, start_s=w.start, end_s=w.end))
+                    words.append(
+                        WordTimestamp(word=w.word.strip(), start_s=w.start, end_s=w.end)
+                    )
 
         return TranscriptResult(
             text=" ".join(text_parts).strip(),
             language=info.language,
             duration_s=info.duration,
             word_timestamps=words,
-            model_id="faster-whisper-large-v3-turbo",
+            model_id=f"faster-whisper-{self._whisper_size}",
         )

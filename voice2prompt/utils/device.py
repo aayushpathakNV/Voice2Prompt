@@ -7,9 +7,9 @@ on fallback so operator knows GPU inference is not active.
 
 from __future__ import annotations
 
-import logging
+from voice2prompt.utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def select_device(preference: str = "auto") -> str:

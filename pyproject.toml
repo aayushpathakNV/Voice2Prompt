@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "voice2prompt"
@@ -35,6 +35,10 @@ dev = [
     "mypy>=1.9",
     "ruff>=0.4",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["voice2prompt*"]
 
 [project.scripts]
 voice2prompt = "voice2prompt.__main__:main"
