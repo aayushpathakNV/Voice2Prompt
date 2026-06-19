@@ -1,0 +1,52 @@
+# Voice2Prompt Pipeline Configuration
+# Swap models per stage without code changes.
+# See docs/architecture.md for model tradeoffs.
+
+stage1:
+  # Primary STT model. Options: parakeet-tdt-0.6b-v2, faster-whisper
+  model: parakeet-tdt-0.6b-v2
+  device: auto  # cuda | mps | cpu (auto = CUDA > MPS > CPU)
+  # Filler pre-pass runs after transcription regardless of model choice
+  filler_pass:
+    enabled: true
+    # Add custom fillers to strip (beyond the built-in list)
+    extra_fillers: []
+
+stage2:
+  # GGUF model filename. Must be in models/ directory or a full path.
+  # Sub-4B required for < 550 ms on RTX 1000 Ada. 8B violates latency SLA.
+  model: Phi-3.5-mini-instruct-Q4_K_M.gguf
+  # Options:
+  #   Phi-3.5-mini-instruct-Q4_K_M.gguf   (~2.5 GB, default)
+  #   gemma-2-2b-instruct-Q4_K_M.gguf     (~1.5 GB, fastest)
+  #   Llama-3.2-3B-instruct-Q4_K_M.gguf   (~2.0 GB)
+  #   Llama-3.1-8B-instruct-Q4_K_M.gguf   (~5.0 GB, quality mode, SLA not met)
+  n_gpu_layers: -1  # Full GPU offload. Set to 0 for CPU-only.
+  max_tokens: 512
+  temperature: 0.0  # Deterministic output
+  context_size: 2048
+
+stage3:
+  model: microsoft/llmlingua-2-bert-large-multilingual-cased-meetingbank
+  device: cuda  # cuda | mps | cpu
+  rate: 0.4             # Retain 40% of tokens (>= 60% reduction target)
+  force_tokens:
+    - "##"
+    - "-"
+    - "**"
+  drop_consecutive: true
+
+emit:
+  # Output format for the compressed prompt
+  format: openai  # openai | anthropic
+  base_url: https://api.openai.com/v1
+  # Set via env var VOICE2PROMPT_API_KEY or pass at runtime
+  api_key: null
+  # Attach pipeline metadata (token savings, ratio) as system prompt header
+  attach_metadata: true
+  model: gpt-4o  # Target cloud model
+
+logging:
+  level: INFO
+  format: json  # json | text
+  # Per-request fields: latency_ms, tokens_in, tokens_out, model_id, stage
