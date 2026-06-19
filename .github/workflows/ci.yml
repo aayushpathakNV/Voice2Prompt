@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      # llama-cpp-python requires a C++ build; install the pre-built CPU wheel
+      # GPU wheels are not available on CI runners — GPU tests run locally only
+      - name: Install llama-cpp-python (CPU, pre-built)
+        run: pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+
+      - name: Lint
+        run: ruff check voice2prompt/ tests/
+
+      - name: Type check
+        run: mypy voice2prompt/ --ignore-missing-imports

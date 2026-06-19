@@ -1,94 +1,108 @@
-# Voice2Prompt — AI Assistant Context
+# CLAUDE.md
 
-## What This Project Does
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Three-stage local pipeline: voice → structured markdown → compressed prompt → cloud LLM API.
+## Commands
 
-- **Stage 1:** Parakeet TDT 0.6B v2 (NeMo/HF) for STT + regex filler pre-pass
-- **Stage 2:** Phi-3.5 Mini Instruct Q4_K_M via llama-cpp-python (streaming output)
-- **Stage 3:** LLMLingua-2 (BERT-large) consuming Stage 2's token stream concurrently
-- **Target:** NVIDIA RTX 1000 Ada Laptop (8 GB GDDR6, 50 W TGP) — P95 E2E < 1 s
+```bash
+# Install (editable + dev deps)
+pip install -e ".[dev]"
 
-## Architecture Constraints to Always Respect
+# Run all tests
+pytest
 
-1. **Stages 1–3 are fully local.** No audio or transcript ever leaves the machine before Stage 3 output. Do not suggest cloud STT or cloud formatting.
+# Run a single test file
+pytest tests/test_stage1.py -v
 
-2. **Stage 2 must use a sub-4B model.** Llama 3.1 8B cannot meet the 550 ms budget on RTX 1000 Ada (~70–90 tok/s → ~1.2 s for 100 tokens). The default is Phi-3.5 Mini Q4_K_M. 8B is only valid as an explicit "quality mode" option.
+# Run a single test by name
+pytest tests/test_stage1.py::TestFillerPass::test_removes_um_and_uh -v
 
-3. **Streaming pipeline is load-bearing.** Stage 3 subscribes to Stage 2's sentence queue via `asyncio.Queue`. The ~120 ms overlap is required to hit < 1 s total. Do not replace with sequential await.
+# Lint
+ruff check voice2prompt/ tests/
 
-4. **VRAM budget is 8 GB total.** All three models must fit concurrently: Parakeet (~0.8 GB) + Phi-3.5 Mini Q4 (~2.5 GB) + LLMLingua-2 (~1.5 GB) + OS/drivers (~1.2 GB) = ~6 GB used, ~2 GB headroom. Any model swap must be checked against this budget.
+# Type check
+mypy voice2prompt/
 
-5. **Stage model swaps happen via `config/pipeline.yaml` only.** No hardcoded model paths in Python. Stage classes read config at init.
+# Benchmark (requires audio fixtures in tests/fixtures/)
+python scripts/benchmark.py --audio tests/fixtures/ --report
+python scripts/benchmark.py --audio my_clip.wav --runs 5 --warmup 2
 
-## Key Latency Budgets (RTX 1000 Ada)
-
-| Stage | Budget |
-|-------|--------|
-| Stage 1 STT | ≤ 100 ms |
-| Stage 1 filler pre-pass | ≤ 5 ms (CPU, regex) |
-| Stage 2 Formatter | ≤ 550 ms |
-| Stage 3 Compressor | ≤ 300 ms (overlapped, not sequential) |
-| Emit + overhead | ≤ 45 ms |
-| **Total P95** | **~850 ms** |
-
-## Python API Contracts
-
-Each stage exposes exactly one public async method:
-
-```python
-# Stage 1
-transcribe(audio: bytes | Path) -> TranscriptResult
-
-# Stage 2
-format_transcript(raw: str) -> AsyncIterator[str]  # streams sentences
-
-# Stage 3
-compress(prompt: AsyncIterator[str]) -> CompressResult
-
-# Orchestrator
-pipeline.run(audio: bytes) -> PipelineResult
+# CLI (after install)
+voice2prompt record            # live microphone
+voice2prompt run audio.wav     # from file
 ```
 
-Do not change these signatures without updating all call sites and tests.
+`pytest-asyncio` is configured with `asyncio_mode = "auto"` — no `@pytest.mark.asyncio` decorator needed on individual tests (though it's present on some for clarity).
 
-## Tech Stack Choices (Do Not Swap Without Explicit Approval)
+## Architecture
 
-| Component | Choice | Why |
-|-----------|--------|-----|
-| STT runtime | NeMo / HF transformers | Parakeet TDT only available here |
-| LLM runtime | llama-cpp-python | Needed for GGUF Q4, full GPU offload, streaming |
-| Compression | llmlingua (pip) | LLMLingua-2 BERT, 3–6× faster than v1 |
-| Async | Python asyncio | asyncio.Queue for streaming pipeline |
-| Config | YAML (PyYAML) | Stage swaps without code changes |
-| Logging | structlog JSON | Per-request latency_ms, tokens_in, tokens_out, model_id |
+Three stages execute as a **streaming pipeline**, not sequentially. The key design decision: Stage 3 starts processing before Stage 2 finishes, saving ~120 ms on the primary target (RTX 1000 Ada, 50W, 8 GB VRAM).
 
-## Testing Requirements
+```
+audio → [Stage 1: STT + filler pre-pass] → clean_text
+                                               ↓
+                              [Stage 2: LLM Formatter]  ──sentences──→  [Stage 3: Compressor]
+                                    (llama-cpp-python)    asyncio.Queue   (LLMLingua-2)
+                                                                              ↓
+                                                                     compressed prompt → API
+```
 
-- ≥ 80% unit test coverage per stage
-- Integration tests in `tests/test_pipeline.py` use the 10 audio fixtures in `tests/fixtures/`
-- Compression tests must assert ROUGE-L ≥ 0.85 and token reduction ≥ 60%
-- Latency tests are benchmarks (not assertions) — they live in `scripts/benchmark.py`
+**The queue is load-bearing.** `pipeline.py` creates an `asyncio.Queue(maxsize=32)`, passes it to both `formatter.stream()` and `compressor.compress_stream()`, then runs both with `asyncio.gather`. Stage 2 puts completed sentences into the queue; Stage 3 consumes them. Stage 2 puts `None` as a sentinel when done. Do not replace this with sequential awaits.
 
-## What NOT to Do
+### Stage responsibilities
 
-- Do not mock the asyncio.Queue in integration tests — use real async iteration
-- Do not add a GUI in v1 (CLI + Python library API is the explicit v1 surface)
-- Do not implement real-time streaming to the cloud API (post-MVP)
-- Do not add multi-speaker diarization (post-MVP)
-- Do not add languages other than English (v1.0 scope)
-- Do not fine-tune any model on user data
+- **Stage 1** (`stage1_stt/`): `Transcriber` wraps Parakeet TDT 0.6B v2 (NeMo → HF transformers fallback) or faster-whisper. Runs blocking inference in a thread pool executor so it doesn't block the event loop. After transcription, `filler_pass()` runs synchronously on CPU (< 5 ms) to strip fillers and false starts before Stage 2 sees the text.
 
-## Emit Layer
+- **Stage 2** (`stage2_formatter/`): `Formatter` uses llama-cpp-python with `stream=True`. Tokens are buffered into sentences and each completed sentence is put onto the queue via `asyncio.run_coroutine_threadsafe` (because llama.cpp runs in a thread pool executor). **Must use a sub-4B model** — 8B at ~70–90 tok/s on RTX 1000 Ada takes ~1.2 s for 100 tokens, exceeding the 550 ms budget.
 
-Supports two formats configured via `emit.format`:
-- `openai`: OpenAI Chat Completions `messages: [{role, content}]`
-- `anthropic`: Anthropic Messages API
+- **Stage 3** (`stage3_compressor/`): `Compressor` consumes the sentence queue, accumulates a buffer, then calls LLMLingua-2 in a thread pool executor when the sentinel arrives. The ROUGE-L method (`_estimate_rouge_l`) is a lightweight LCS approximation used at runtime; full evaluation uses `rouge-score` in tests.
 
-Accepts any `base_url` for OpenAI-compatible endpoints (NVIDIA NIM, vLLM, Ollama).
-Pipeline metadata (token savings, compression ratio) attached as system prompt header when `attach_metadata: true`.
+- **Emit** (`emit/api_client.py`): Wraps compressed prompt in OpenAI Chat Completions or Anthropic Messages format. Accepts any `base_url` for OpenAI-compatible endpoints (NVIDIA NIM, vLLM, Ollama). API key is read from `VOICE2PROMPT_API_KEY` env var.
 
-## Owner
+### Model loading
 
-Aayush Pathak (aapathak@nvidia.com)
-PRD: `../Voice_to_Prompt_Pipeline_PRD.docx` — Version 0.2, June 2026
+All three models are **lazy-loaded** on the first call to avoid paying startup cost unless the stage is used. Calling `_load_model()` a second time is a no-op. Models stay resident in VRAM for the lifetime of the process — there is no model swapping between requests.
+
+VRAM budget at steady state (RTX 1000 Ada, 8 GB): Parakeet ~0.8 GB + Phi-3.5 Mini Q4 ~2.5 GB + LLMLingua-2 ~1.5 GB + OS/drivers ~1.2 GB ≈ 6 GB used, ~2 GB headroom.
+
+### Config
+
+`config/pipeline.yaml` is the only place to change models or tuning knobs. Stage classes read their sub-dict at `__init__` time. Never hardcode model paths in Python.
+
+### Cross-platform device selection
+
+`utils/device.py:select_device()` resolves `"auto"` → CUDA → MPS → CPU in that order, logging a warning on each fallback. All stage constructors call this at init. CPU fallback is supported but degrades P95 latency to ~5–7 s.
+
+## Public API contracts
+
+Do not change these signatures without updating all call sites and tests:
+
+```python
+# pipeline.py
+Pipeline.from_config(config_path: str | Path) -> Pipeline
+await pipeline.run(audio: bytes | Path) -> PipelineResult
+
+# stage1_stt/transcriber.py
+await transcriber.transcribe(audio: bytes | Path) -> TranscriptResult
+
+# stage1_stt/filler_pass.py  (sync, CPU-only)
+filler_pass(text: str, extra_fillers: list[str] | None) -> str
+
+# stage2_formatter/formatter.py
+await formatter.stream(transcript: str, queue: asyncio.Queue) -> None
+
+# stage3_compressor/compressor.py
+await compressor.compress_stream(queue: asyncio.Queue) -> CompressResult
+await compressor.compress(prompt: str, dry_run: bool) -> CompressResult  # single-shot, for tests
+```
+
+## Testing approach
+
+- Unit tests mock the model (`_load_model` + `_compress_sync` / `_stream_sync`) but use real `asyncio.Queue` instances — never mock the queue.
+- `test_pipeline.py` validates orchestration logic (queue handoff, gather, result shape) without GPU by monkeypatching all three stages.
+- `tests/fixtures/` holds `.wav` files for integration tests; the fixture-based tests in `test_pipeline.py` auto-skip when the directory is empty.
+- Latency assertions do not belong in tests — use `scripts/benchmark.py` for those.
+
+## Out of scope for v1
+
+No GUI, no real-time cloud streaming, no multi-speaker diarization, no non-English languages, no model fine-tuning.

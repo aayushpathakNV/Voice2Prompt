@@ -12,9 +12,11 @@ license = { text = "MIT" }
 authors = [{ name = "Aayush Pathak", email = "aapathak@nvidia.com" }]
 
 dependencies = [
-    # Stage 1 — STT
+    # Stage 1 — STT + audio capture
     "faster-whisper>=1.0.0",
     "soundfile>=0.12.1",
+    "sounddevice>=0.4.6",
+    "numpy>=1.24",
     # Stage 2 — LLM Formatter
     "llama-cpp-python>=0.2.90",
     # Stage 3 — Compressor
