@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Models (large binary files)
+models/
+
+# Recovery artifacts
+recovery_meta.txt
+transcriber_dis.txt
+utils_dis.txt
+
+# Env / secrets
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
