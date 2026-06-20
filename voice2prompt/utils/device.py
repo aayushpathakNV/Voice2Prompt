@@ -13,17 +13,24 @@ logger = get_logger(__name__)
 
 
 def select_device(preference: str = "auto") -> str:
+    """
+    Resolve a device string to a concrete torch device.
+
+    Args:
+        preference: "auto" | "cuda" | "mps" | "cpu"
+
+    Returns:
+        Resolved device string, e.g. "cuda", "mps", "cpu".
+    """
     if preference not in ("auto", "cuda", "mps", "cpu"):
-        logger.warning(
-            "unknown_device_preference", preference=preference, fallback="auto"
-        )
+        logger.warning("unknown_device_preference", preference=preference, fallback="auto")
         preference = "auto"
 
     if preference == "cpu":
         return "cpu"
 
     try:
-        import torch
+        import torch  # type: ignore
     except ImportError:
         logger.warning("torch_not_installed", fallback="cpu")
         return "cpu"
@@ -32,7 +39,7 @@ def select_device(preference: str = "auto") -> str:
         if torch.cuda.is_available():
             device = "cuda"
             name = torch.cuda.get_device_name(0)
-            vram_gb = torch.cuda.get_device_properties(0).total_memory / 1_000_000_000.0
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
             logger.info("device_selected", device=device, name=name, vram_gb=round(vram_gb, 1))
             return device
         if preference == "cuda":

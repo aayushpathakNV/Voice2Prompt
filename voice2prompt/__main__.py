@@ -1,179 +1,207 @@
 """
-voice2prompt CLI entry point.
+CLI entry point for Voice2Prompt.
 
-Usage
------
-# Push-to-talk (hold Ctrl+Shift+R, release to process):
-    py -m voice2prompt record
+Usage:
+    voice2prompt record              # capture from microphone until silence
+    voice2prompt run <audio_file>    # process a WAV/MP3/M4A file
+    voice2prompt devices             # list available input devices
+    voice2prompt --help
 
-# Push-to-talk with custom hotkey:
-    py -m voice2prompt record --hotkey alt+shift+p
-
-# Process a WAV file directly (no mic):
-    py -m voice2prompt run audio.wav
-
-# Run Stage 1 only (filler-pass on text):
-    py -m voice2prompt clean "um so I want to build uh a REST API"
-
-Stage 2 requires the GGUF model at:
-    models/Phi-3.5-mini-instruct-Q4_K_M.gguf
-
-Download from: https://huggingface.co/microsoft/Phi-3.5-mini-instruct-gguf
+All commands write the compressed prompt to stdout so it can be piped:
+    voice2prompt run clip.wav | pbcopy        (macOS)
+    voice2prompt run clip.wav | clip          (Windows)
+    voice2prompt run clip.wav | xclip -sel c  (Linux)
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from pathlib import Path
 
 
-def _make_parser() -> argparse.ArgumentParser:
+def _find_config() -> Path:
+    """Locate config/pipeline.yaml relative to CWD or package root."""
+    candidates = [
+        Path("config/pipeline.yaml"),
+        Path(__file__).parents[1] / "config" / "pipeline.yaml",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    raise FileNotFoundError(
+        "config/pipeline.yaml not found. Run from the project root or pass --config."
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="voice2prompt",
-        description="Local voice → structured prompt pipeline",
+        description="Local voice → compressed prompt pipeline",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    # record subcommand
-    rec = sub.add_parser("record", help="Push-to-talk mic recording (hold hotkey)")
-    rec.add_argument(
-        "--hotkey",
-        default="ctrl+shift+r",
-        help="Global hotkey to hold while speaking, e.g. ctrl+shift+r, alt+shift+p (default: ctrl+shift+r)",
+    parser.add_argument("--config", type=Path, default=None, help="Path to pipeline.yaml")
+    parser.add_argument(
+        "--json", action="store_true", help="Output full JSON result instead of prompt text"
     )
-    rec.add_argument(
-        "--stage2",
-        action="store_true",
-        default=True,
-        help="Run Stage 2 formatter after transcription (default: on)",
-    )
-    rec.add_argument("--no-stage2", dest="stage2", action="store_false")
-    rec.add_argument(
-        "--model",
-        default="Phi-3.5-mini-instruct-Q4_K_M.gguf",
-        help="GGUF model filename inside models/ dir",
-    )
-    rec.add_argument(
-        "--whisper-size",
-        default="base",
-        dest="whisper_size",
-        help="faster-whisper model size: tiny|base|small|medium|large-v3-turbo (default: base)",
+    parser.add_argument(
+        "--no-emit", action="store_true", help="Skip cloud API call; print compressed prompt only"
     )
 
-    # run subcommand (from file)
-    run = sub.add_parser("run", help="Process an existing audio file")
-    run.add_argument("audio", type=Path, help="Path to WAV file")
-    run.add_argument("--no-stage2", dest="stage2", action="store_false", default=True)
-    run.add_argument(
-        "--model",
-        default="Phi-3.5-mini-instruct-Q4_K_M.gguf",
-        help="GGUF model filename inside models/ dir",
+    sub = parser.add_subparsers(dest="command")
+
+    # record
+    rec = sub.add_parser("record", help="Capture from microphone until silence")
+    rec.add_argument("--device", default=None, help="Input device index or name")
+    rec.add_argument(
+        "--silence", type=float, default=1.5, help="Seconds of silence before auto-stop (default 1.5)"
+    )
+    rec.add_argument(
+        "--max-duration", type=float, default=60.0, help="Max recording duration in seconds"
     )
 
-    # clean subcommand (text only, no audio)
-    clean = sub.add_parser("clean", help="Run Stage 1 filler-pass on raw text")
-    clean.add_argument("text", help="Raw transcript text to clean")
+    # run
+    run = sub.add_parser("run", help="Process an audio file")
+    run.add_argument("file", type=Path, help="WAV, MP3, or M4A file to process")
+
+    # devices
+    sub.add_parser("devices", help="List available audio input devices")
 
     return parser
 
 
-async def _run_pipeline(
-    audio: bytes | Path,
-    run_stage2: bool,
-    model: str,
-    whisper_size: str = "base",
-) -> None:
-    from voice2prompt.stage1_stt.filler_pass import filler_pass
-    from voice2prompt.stage1_stt.transcriber import Transcriber
+async def _run_pipeline(audio_bytes: bytes, config_path: Path, no_emit: bool) -> dict:
+    from voice2prompt.pipeline import Pipeline
 
-    # ── Stage 1 ──────────────────────────────────────────────────────────────
-    print(f"\n[Stage 1] Loading STT model (faster-whisper '{whisper_size}')…", flush=True)
-    print("          (first run downloads the model — may take a moment)", flush=True)
-    transcriber = Transcriber({
-        "model": "faster-whisper",
-        "device": "auto",
-        "whisper_size": whisper_size,
-    })
-    print("[Stage 1] Transcribing audio…", flush=True)
-    result = await transcriber.transcribe(audio)
+    pipeline = Pipeline.from_config(config_path)
+    result = await pipeline.run(audio_bytes)
 
-    print(f"  Raw transcript ({result.latency_ms:.0f} ms):  {result.text!r}")
-    cleaned = filler_pass(result.text)
-    print(f"  After filler-pass:              {cleaned!r}")
+    output = {
+        "prompt": result.prompt,
+        "metadata": {
+            "total_latency_ms": round(result.metadata.total_latency_ms, 1),
+            "stage1_latency_ms": round(result.metadata.stage1_latency_ms, 1),
+            "stage2_latency_ms": round(result.metadata.stage2_latency_ms, 1),
+            "stage3_latency_ms": round(result.metadata.stage3_latency_ms, 1),
+            "original_tokens": result.metadata.original_tokens,
+            "compressed_tokens": result.metadata.compressed_tokens,
+            "compression_ratio": result.metadata.compression_ratio,
+            "rouge_l_estimate": round(result.metadata.rouge_l_estimate, 3),
+        },
+        "raw_transcript": result.raw_transcript,
+    }
 
-    if not run_stage2:
-        print("\nResult:\n" + cleaned)
-        return
+    if not no_emit and result.prompt:
+        try:
+            emit_result = await pipeline._emitter.send(
+                result.prompt,
+                original_tokens=result.metadata.original_tokens,
+                compressed_tokens=result.metadata.compressed_tokens,
+                ratio=result.metadata.compression_ratio,
+            )
+            output["api_response"] = emit_result.api_response
+        except Exception as e:
+            output["emit_error"] = str(e)
 
-    # ── Stage 2 ──────────────────────────────────────────────────────────────
-    from voice2prompt.stage2_formatter.formatter import Formatter
+    return output
 
-    print("\n[Stage 2] Formatting…")
-    formatter = Formatter({"model": model, "n_gpu_layers": -1, "max_tokens": 512})
 
-    queue: asyncio.Queue = asyncio.Queue()
-    sentences: list[str] = []
+def _cmd_devices() -> None:
+    try:
+        from voice2prompt.audio import list_input_devices
+        devices = list_input_devices()
+        if not devices:
+            print("No input devices found.", file=sys.stderr)
+            return
+        print(f"{'Index':<6} {'Name'}")
+        print("-" * 50)
+        for d in devices:
+            print(f"{d['index']:<6} {d['name']}")
+    except ImportError:
+        print("sounddevice not installed. Run: pip install sounddevice", file=sys.stderr)
+        sys.exit(1)
 
-    async def _collect() -> None:
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            sentences.append(item)
-            print(f"  {item}")
 
-    await asyncio.gather(
-        formatter.stream(cleaned, queue),
-        _collect(),
+def _cmd_record(args: argparse.Namespace, config_path: Path, output_json: bool, no_emit: bool) -> None:
+    try:
+        from voice2prompt.audio import AudioCaptureConfig, record_until_silence
+    except ImportError:
+        print("sounddevice not installed. Run: pip install sounddevice", file=sys.stderr)
+        sys.exit(1)
+
+    cfg = AudioCaptureConfig(
+        silence_duration_s=args.silence,
+        max_duration_s=args.max_duration,
+        device=args.device,
     )
 
-    print("\n── Structured prompt ──────────────────────────────")
-    print("\n".join(sentences))
-    print("───────────────────────────────────────────────────")
+    print("Listening… speak now. Recording stops after silence.", file=sys.stderr)
+
+    def _on_start():
+        print("  [recording]", file=sys.stderr)
+
+    def _on_silence():
+        print("  [silence detected, stopping]", file=sys.stderr)
+
+    try:
+        audio_bytes = record_until_silence(cfg, on_speech_start=_on_start, on_silence_detected=_on_silence)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    result = asyncio.run(_run_pipeline(audio_bytes, config_path, no_emit))
+    _print_result(result, output_json)
+
+
+def _cmd_run(args: argparse.Namespace, config_path: Path, output_json: bool, no_emit: bool) -> None:
+    if not args.file.exists():
+        print(f"File not found: {args.file}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        from voice2prompt.audio import load_audio_file
+        audio_bytes = load_audio_file(args.file)
+    except RuntimeError as e:
+        print(f"Error loading audio: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    result = asyncio.run(_run_pipeline(audio_bytes, config_path, no_emit))
+    _print_result(result, output_json)
+
+
+def _print_result(result: dict, output_json: bool) -> None:
+    if output_json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(result["prompt"])
+        meta = result["metadata"]
+        print(
+            f"\n[voice2prompt] {meta['total_latency_ms']:.0f} ms | "
+            f"{meta['original_tokens']} → {meta['compressed_tokens']} tokens "
+            f"({meta['compression_ratio']}) | ROUGE-L {meta['rouge_l_estimate']}",
+            file=sys.stderr,
+        )
 
 
 def main() -> None:
-    parser = _make_parser()
+    parser = _build_parser()
     args = parser.parse_args()
 
-    if args.command == "clean":
-        from voice2prompt.stage1_stt.filler_pass import filler_pass
-        print(filler_pass(args.text))
+    if args.command is None:
+        parser.print_help()
+        sys.exit(0)
+
+    if args.command == "devices":
+        _cmd_devices()
         return
 
+    config_path = args.config or _find_config()
+
     if args.command == "record":
-        from voice2prompt.audio import record_push_to_talk
-
-        print(f"voice2prompt ready  |  hotkey: {args.hotkey.upper()}  |  Ctrl+C to quit")
-        print("─" * 55, flush=True)
-
-        try:
-            while True:
-                audio_bytes = record_push_to_talk(
-                    hotkey=args.hotkey,
-                    on_start=lambda: print("  ● Recording…", flush=True),
-                    on_stop=lambda: print("  ■ Stopped.\n", flush=True),
-                )
-                if not audio_bytes:
-                    print("No audio captured (held too briefly — try again).\n")
-                    continue
-
-                asyncio.run(_run_pipeline(
-                    audio_bytes, args.stage2, args.model,
-                    whisper_size=args.whisper_size,
-                ))
-                print("\n─" * 28, flush=True)
-
-        except KeyboardInterrupt:
-            print("\nGoodbye.")
-
+        _cmd_record(args, config_path, args.json, args.no_emit)
     elif args.command == "run":
-        if not args.audio.exists():
-            print(f"File not found: {args.audio}", file=sys.stderr)
-            sys.exit(1)
-        asyncio.run(_run_pipeline(args.audio, args.stage2, args.model))
+        _cmd_run(args, config_path, args.json, args.no_emit)
 
 
 if __name__ == "__main__":

@@ -25,31 +25,15 @@ class _JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        skip = {
-            "args",
-            "created",
-            "exc_info",
-            "exc_text",
-            "filename",
-            "funcName",
-            "levelname",
-            "levelno",
-            "lineno",
-            "message",
-            "module",
-            "msecs",
-            "msg",
-            "name",
-            "pathname",
-            "process",
-            "processName",
-            "relativeCreated",
-            "stack_info",
-            "thread",
-            "threadName",
-        }
+        # Extra key=value fields passed via logger.info("msg", key=val)
         for key, val in record.__dict__.items():
-            if key not in skip:
+            if key not in (
+                "args", "created", "exc_info", "exc_text", "filename",
+                "funcName", "levelname", "levelno", "lineno", "message",
+                "module", "msecs", "msg", "name", "pathname", "process",
+                "processName", "relativeCreated", "stack_info", "thread",
+                "threadName",
+            ):
                 payload[key] = val
         return json.dumps(payload)
 
@@ -57,10 +41,9 @@ class _JsonFormatter(logging.Formatter):
 class _KVAdapter(logging.LoggerAdapter):
     """Allows logger.info("event", key=val, ...) syntax."""
 
-    def process(
-        self, msg: str, kwargs: MutableMapping[str, Any]
-    ) -> tuple[str, MutableMapping[str, Any]]:
+    def process(self, msg: str, kwargs: MutableMapping[str, Any]) -> tuple[str, MutableMapping[str, Any]]:
         extra = kwargs.pop("extra", {})
+        # Merge any keyword args into extra so the formatter picks them up
         for k in list(kwargs.keys()):
             if k not in ("exc_info", "stack_info", "stacklevel"):
                 extra[k] = kwargs.pop(k)
@@ -78,7 +61,8 @@ def get_logger(name: str) -> _KVAdapter:
     return _KVAdapter(base, {})
 
 
-def configure_root(level: str = "INFO", fmt: str = "json") -> None:
+def configure_root(level: str = "INFO", fmt: str = "json"):
+    """Call once at application startup from pipeline.py or CLI entry point."""
     numeric = getattr(logging, level.upper(), logging.INFO)
     root = logging.getLogger("voice2prompt")
     root.setLevel(numeric)

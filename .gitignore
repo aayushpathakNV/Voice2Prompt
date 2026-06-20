@@ -1,28 +1,64 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
+.Python
 *.egg-info/
 dist/
 build/
 .eggs/
+*.egg
 
-# Models (large binary files)
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Models (large binary files — store separately)
 models/
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
 
-# Recovery artifacts
-recovery_meta.txt
-transcriber_dis.txt
-utils_dis.txt
+# Benchmark output
+benchmark_report.json
 
-# Env / secrets
-.env
-*.env
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Type checking
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
 
 # IDE
 .vscode/
 .idea/
-.claude/
+*.swp
+*.swo
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# Audio test fixtures (checked in separately if needed)
+tests/fixtures/*.wav
+tests/fixtures/*.mp3
+tests/fixtures/*.m4a
+
+# Env / secrets
+.env
+.env.*
+*.key
+
+# Logs
+*.log
+logs/

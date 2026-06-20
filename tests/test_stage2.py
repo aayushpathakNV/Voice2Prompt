@@ -8,23 +8,18 @@ Coverage targets:
   - Model NOT loaded during instantiation (lazy loading)
 """
 
-from __future__ import annotations
-
 import asyncio
-
 import pytest
 
 
 class TestFormatterConfig:
-    def test_instantiation(self) -> None:
+    def test_instantiation(self):
         from voice2prompt.stage2_formatter.formatter import Formatter
-
         f = Formatter({"model": "Phi-3.5-mini-instruct-Q4_K_M.gguf", "n_gpu_layers": -1})
-        assert f._llm is None
+        assert f._llm is None  # model is lazy-loaded
 
-    def test_default_config(self) -> None:
+    def test_default_config(self):
         from voice2prompt.stage2_formatter.formatter import Formatter
-
         f = Formatter({})
         assert f._max_tokens == 512
         assert f._temperature == 0.0
@@ -33,28 +28,30 @@ class TestFormatterConfig:
 
 class TestFormatterStreaming:
     @pytest.fixture
-    def formatter_with_mock(self, monkeypatch: pytest.MonkeyPatch):
+    def formatter_with_mock(self, monkeypatch):
         from voice2prompt.stage2_formatter.formatter import Formatter
 
-        f = Formatter({})
+        f = Formatter({"model": "mock.gguf"})
 
-        def _fake_load() -> None:
-            f._llm = object()
+        def _fake_load():
+            f._llm = object()  # non-None so _load_model is a no-op
 
-        def _fake_stream_sync(transcript: str, queue: asyncio.Queue, loop) -> None:
+        def _fake_stream_sync(transcript, queue, loop):
+            # Simulate two sentences being emitted then sentinel
             asyncio.run_coroutine_threadsafe(queue.put("## Goal"), loop)
             asyncio.run_coroutine_threadsafe(queue.put("- Build a fast API."), loop)
+            asyncio.run_coroutine_threadsafe(queue.put(None), loop)
 
         monkeypatch.setattr(f, "_load_model", _fake_load)
         monkeypatch.setattr(f, "_stream_sync", _fake_stream_sync)
         return f
 
     @pytest.mark.asyncio
-    async def test_stream_sends_sentinel(self, formatter_with_mock) -> None:
+    async def test_stream_sends_sentinel(self, formatter_with_mock):
         queue: asyncio.Queue = asyncio.Queue()
         await formatter_with_mock.stream("build an API", queue)
 
-        items: list[str | None] = []
+        items = []
         while True:
             item = await asyncio.wait_for(queue.get(), timeout=1.0)
             if item is None:
@@ -62,14 +59,14 @@ class TestFormatterStreaming:
             items.append(item)
 
         assert None not in items
-        assert any(s for s in items)
+        assert any("##" in s for s in items)
 
     @pytest.mark.asyncio
-    async def test_stream_output_has_heading_and_bullet(self, formatter_with_mock) -> None:
+    async def test_stream_output_has_heading_and_bullet(self, formatter_with_mock):
         queue: asyncio.Queue = asyncio.Queue()
         await formatter_with_mock.stream("build an API", queue)
 
-        collected: list[str] = []
+        collected = []
         while True:
             item = await asyncio.wait_for(queue.get(), timeout=1.0)
             if item is None:

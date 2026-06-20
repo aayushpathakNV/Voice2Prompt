@@ -1,3 +1,3 @@
-"""Voice2Prompt package."""
+from voice2prompt.pipeline import Pipeline, PipelineResult
 
-__version__ = "0.2.0"
+__all__ = ["Pipeline", "PipelineResult"]

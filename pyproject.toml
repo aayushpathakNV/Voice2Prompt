@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Aayush Pathak", email = "aapathak@nvidia.com" }]
+
+# Lightweight base: pure-Python or trivially installable on all platforms.
+# All ML/audio runtime deps are in [ml] below.
 dependencies = [
     "httpx>=0.27.0",
     "numpy>=1.24",
@@ -17,13 +20,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Full ML runtime — install locally with: pip install -e ".[ml]"
+# Not required for tests (all model calls are mocked).
 ml = [
+    # Stage 1 — STT
     "faster-whisper>=1.0.0",
     "soundfile>=0.12.1",
+    # Stage 1 — audio capture (requires PortAudio system library)
     "sounddevice>=0.4.6",
+    # Stage 2 — LLM Formatter (requires C++ build toolchain or pre-built wheel)
     "llama-cpp-python>=0.2.90",
+    # Stage 3 — Compressor (pulls in torch ~2 GB)
     "llmlingua>=0.2.2",
 ]
+
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -31,24 +41,28 @@ dev = [
     "mypy>=1.9",
     "ruff>=0.4",
 ]
-all = ["voice2prompt[dev,ml]"]
 
-[project.scripts]
-voice2prompt = "voice2prompt.__main__:main"
+# Convenience: everything at once for local development
+all = [
+    "voice2prompt[ml,dev]",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["voice2prompt*"]
 
+[project.scripts]
+voice2prompt = "voice2prompt.__main__:main"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+strict = false
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-
-[tool.mypy]
-python_version = "3.10"
-warn_return_any = true
-warn_unused_configs = true
