@@ -3,6 +3,7 @@ CLI entry point for Voice2Prompt.
 
 Usage:
     voice2prompt record              # capture from microphone until silence
+    voice2prompt hotkey              # hold Ctrl+Shift+R to record (push-to-talk loop)
     voice2prompt run <audio_file>    # process a WAV/MP3/M4A file
     voice2prompt devices             # list available input devices
     voice2prompt --help
@@ -67,6 +68,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # devices
     sub.add_parser("devices", help="List available audio input devices")
+
+    # hotkey  (push-to-talk, Windows Win32 global hotkey)
+    hk = sub.add_parser(
+        "hotkey",
+        help="Push-to-talk: hold hotkey to record, release to process (loops until Ctrl+C)",
+    )
+    hk.add_argument(
+        "--hotkey",
+        default="ctrl+shift+r",
+        help="Key combo to hold while speaking (default: ctrl+shift+r)",
+    )
+    hk.add_argument("--device", default=None, help="Input device index or name")
 
     return parser
 
@@ -170,6 +183,36 @@ def _cmd_run(args: argparse.Namespace, config_path: Path, output_json: bool, no_
     _print_result(result, output_json)
 
 
+def _cmd_hotkey(args: argparse.Namespace, config_path: Path, output_json: bool, no_emit: bool) -> None:
+    """Push-to-talk loop: hold hotkey → record → pipeline → repeat until Ctrl+C."""
+    try:
+        from voice2prompt.audio import record_push_to_talk
+    except ImportError:
+        print("sounddevice not installed. Run: pip install sounddevice", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"voice2prompt  |  hotkey: {args.hotkey.upper()}  |  Ctrl+C to quit", file=sys.stderr)
+    print("-" * 55, file=sys.stderr)
+
+    try:
+        while True:
+            audio_bytes = record_push_to_talk(
+                hotkey=args.hotkey,
+                on_start=lambda: print("  ● Recording…", file=sys.stderr, flush=True),
+                on_stop=lambda: print("  ■ Stopped.\n", file=sys.stderr, flush=True),
+            )
+            if not audio_bytes:
+                print("No audio captured (held too briefly — try again).\n", file=sys.stderr)
+                continue
+
+            result = asyncio.run(_run_pipeline(audio_bytes, config_path, no_emit))
+            _print_result(result, output_json)
+            print("-" * 55, file=sys.stderr)
+
+    except KeyboardInterrupt:
+        print("\nGoodbye.", file=sys.stderr)
+
+
 def _print_result(result: dict, output_json: bool) -> None:
     if output_json:
         print(json.dumps(result, indent=2))
@@ -202,6 +245,8 @@ def main() -> None:
         _cmd_record(args, config_path, args.json, args.no_emit)
     elif args.command == "run":
         _cmd_run(args, config_path, args.json, args.no_emit)
+    elif args.command == "hotkey":
+        _cmd_hotkey(args, config_path, args.json, args.no_emit)
 
 
 if __name__ == "__main__":

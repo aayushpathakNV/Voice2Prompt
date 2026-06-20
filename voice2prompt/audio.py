@@ -221,6 +221,124 @@ def _decode_via_ffmpeg(path: str) -> bytes:
     return result.stdout
 
 
+def record_push_to_talk(
+    hotkey: str = "ctrl+shift+r",
+    on_start: Callable[[], None] | None = None,
+    on_stop: Callable[[], None] | None = None,
+    _use_enter_fallback: bool = False,
+) -> bytes:
+    """
+    Hold `hotkey` to record — release to stop (WhisperFlow-style push-to-talk).
+
+    On Windows uses Win32 ``RegisterHotKey`` + ``GetAsyncKeyState`` so the
+    hotkey is intercepted globally even when another window has focus.
+    No admin rights required.  Falls back to Enter-to-start / Enter-to-stop
+    on non-Windows systems or when hotkey registration fails.
+
+    Args:
+        hotkey:              Key combo string, e.g. ``"ctrl+shift+r"`` or ``"alt+p"``.
+        on_start:            Optional callback fired when recording begins.
+        on_stop:             Optional callback fired when recording ends.
+        _use_enter_fallback: Force the Enter-based fallback (useful for testing).
+
+    Returns:
+        WAV-encoded bytes (16 kHz mono int16), or ``b""`` if nothing captured.
+    """
+    import time
+
+    try:
+        import sounddevice as sd  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Audio capture requires 'sounddevice'. Install with: pip install sounddevice"
+        ) from exc
+
+    frames: list[np.ndarray] = []
+    audio_q: queue.Queue[np.ndarray] = queue.Queue()
+    stop_event = threading.Event()
+
+    def _callback(indata: np.ndarray, _frames: int, _time, status) -> None:
+        if status:
+            pass  # ignore overflow warnings during push-to-talk
+        audio_q.put(indata[:, 0].copy())
+
+    def _drain() -> None:
+        while not stop_event.is_set():
+            try:
+                frames.append(audio_q.get(timeout=0.05))
+            except queue.Empty:
+                pass
+        while not audio_q.empty():
+            try:
+                frames.append(audio_q.get_nowait())
+            except queue.Empty:
+                break
+
+    use_win32 = platform.system() == "Windows" and not _use_enter_fallback
+
+    if use_win32:
+        try:
+            from voice2prompt.hotkey import is_hotkey_held, wait_for_hotkey_press
+
+            print(f"\nHold [{hotkey.upper()}] to record — release to process...", flush=True)
+            wait_for_hotkey_press(hotkey)
+
+            if on_start:
+                on_start()
+
+            with sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
+                blocksize=BLOCK_FRAMES, callback=_callback,
+            ):
+                drain_thread = threading.Thread(target=_drain, daemon=True)
+                drain_thread.start()
+                while is_hotkey_held(hotkey):
+                    time.sleep(0.01)
+                stop_event.set()
+                drain_thread.join(timeout=1.0)
+
+        except OSError as exc:
+            print(f"\n  [hotkey] {exc}", flush=True)
+            print("  Falling back to Enter-to-start / Enter-to-stop.\n", flush=True)
+            use_win32 = False
+
+    if not use_win32:
+        con = "CON" if platform.system() == "Windows" else "/dev/tty"
+        print("\nPress [Enter] to START recording...", flush=True)
+        try:
+            input()
+        except EOFError:
+            with open(con) as tty:
+                tty.readline()
+
+        if on_start:
+            on_start()
+
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
+            blocksize=BLOCK_FRAMES, callback=_callback,
+        ):
+            drain_thread = threading.Thread(target=_drain, daemon=True)
+            drain_thread.start()
+            print("Press [Enter] to STOP recording...", flush=True)
+            try:
+                input()
+            except EOFError:
+                with open(con) as tty:
+                    tty.readline()
+            stop_event.set()
+            drain_thread.join(timeout=1.0)
+
+    if on_stop:
+        on_stop()
+
+    if not frames:
+        return b""
+
+    audio_np = np.concatenate(frames)
+    return _to_wav_bytes(audio_np, SAMPLE_RATE)
+
+
 def _to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
